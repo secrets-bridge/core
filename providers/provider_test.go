@@ -67,7 +67,8 @@ func TestSecretValue_Redaction(t *testing.T) {
 		"String()":     v.String(),
 		"GoString()":   v.GoString(),
 		"fmt %v":       fmt.Sprintf("%v", v),
-		"fmt %s":       fmt.Sprintf("%s", v),
+		"fmt %s":       fmt.Sprintf("%s", v), //nolint:staticcheck // S1025: intentional — the test verifies %s reaches String(), not the shortcut
+
 		"fmt %+v":      fmt.Sprintf("%+v", v),
 		"fmt %#v":      fmt.Sprintf("%#v", v),
 		"fmt in error": fmt.Errorf("oh no: %v", v).Error(),
