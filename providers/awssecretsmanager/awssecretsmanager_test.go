@@ -283,3 +283,151 @@ func TestPutValue_PropagatesNonRecoverableError(t *testing.T) {
 		t.Fatal("CreateSecret must NOT be attempted on a non-not-found Put error")
 	}
 }
+
+// listFixture returns a single page with the three example secrets used
+// across the filter tests below. Each carries a distinct tag set so the
+// filters land on the right rows.
+func listFixture() []*secretsmanager.ListSecretsOutput {
+	return []*secretsmanager.ListSecretsOutput{
+		{
+			SecretList: []smtypes.SecretListEntry{
+				{
+					Name: awsv2.String("/eks/uat/archive/env"),
+					Tags: []smtypes.Tag{
+						{Key: awsv2.String("EnvironmentName"), Value: awsv2.String("E-Government-Uat")},
+						{Key: awsv2.String("Project"), Value: awsv2.String("Electronic Government")},
+					},
+				},
+				{
+					Name: awsv2.String("/eks/prod/archive/env"),
+					Tags: []smtypes.Tag{
+						{Key: awsv2.String("EnvironmentName"), Value: awsv2.String("E-Government-Prod")},
+						{Key: awsv2.String("Project"), Value: awsv2.String("Electronic Government")},
+					},
+				},
+				{
+					Name: awsv2.String("/eks/uat/pension/env"),
+					Tags: []smtypes.Tag{
+						{Key: awsv2.String("EnvironmentName"), Value: awsv2.String("E-Government-Uat")},
+						{Key: awsv2.String("Project"), Value: awsv2.String("Pension")},
+					},
+				},
+			},
+		},
+	}
+}
+
+func TestListMetadata_TagFilterDropsNonMatchingRows(t *testing.T) {
+	fc := &fakeClient{listPages: listFixture()}
+	p := &Provider{
+		client:    fc,
+		tagFilter: map[string]string{"EnvironmentName": "E-Government-Uat"},
+	}
+
+	got, err := p.ListMetadata(t.Context(), providers.ProviderScope{Scope: "default"})
+	if err != nil {
+		t.Fatalf("ListMetadata: %v", err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("expected 2 UAT rows, got %d: %+v", len(got), refNames(got))
+	}
+	for _, m := range got {
+		if m.Labels["EnvironmentName"] != "E-Government-Uat" {
+			t.Errorf("leaked non-UAT row %q with EnvironmentName=%q", m.Ref.Name, m.Labels["EnvironmentName"])
+		}
+	}
+}
+
+func TestListMetadata_ScopeLabelSelectorANDsWithTagFilter(t *testing.T) {
+	fc := &fakeClient{listPages: listFixture()}
+	p := &Provider{
+		client:    fc,
+		tagFilter: map[string]string{"EnvironmentName": "E-Government-Uat"},
+	}
+
+	got, err := p.ListMetadata(t.Context(), providers.ProviderScope{
+		Scope:         "default",
+		LabelSelector: map[string]string{"Project": "Pension"},
+	})
+	if err != nil {
+		t.Fatalf("ListMetadata: %v", err)
+	}
+	if len(got) != 1 || got[0].Ref.Name != "/eks/uat/pension/env" {
+		t.Fatalf("AND of tagFilter+LabelSelector should leave only pension/env, got %v", refNames(got))
+	}
+}
+
+func TestListMetadata_NoFiltersReturnsEverything(t *testing.T) {
+	fc := &fakeClient{listPages: listFixture()}
+	p := newTestProvider(fc)
+
+	got, err := p.ListMetadata(t.Context(), providers.ProviderScope{Scope: "default"})
+	if err != nil {
+		t.Fatalf("ListMetadata: %v", err)
+	}
+	if len(got) != 3 {
+		t.Fatalf("no filters → expected 3 rows, got %d: %v", len(got), refNames(got))
+	}
+}
+
+func TestReadTagFilter_AcceptsBothShapes(t *testing.T) {
+	cases := []struct {
+		name string
+		in   any
+		want map[string]string
+	}{
+		{"nil", nil, nil},
+		{"empty-string-map", map[string]string{}, nil},
+		{"empty-any-map", map[string]any{}, nil},
+		{"string-map", map[string]string{"EnvironmentName": "uat"}, map[string]string{"EnvironmentName": "uat"}},
+		{"any-map-of-strings", map[string]any{"EnvironmentName": "uat"}, map[string]string{"EnvironmentName": "uat"}},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got, err := readTagFilter(c.in)
+			if err != nil {
+				t.Fatalf("readTagFilter: %v", err)
+			}
+			if !mapsEqual(got, c.want) {
+				t.Errorf("got %v want %v", got, c.want)
+			}
+		})
+	}
+}
+
+func TestReadTagFilter_RejectsBadShapes(t *testing.T) {
+	cases := []struct {
+		name string
+		in   any
+	}{
+		{"non-string-value", map[string]any{"k": 42}},
+		{"wrong-outer-type", []string{"k", "v"}},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if _, err := readTagFilter(c.in); err == nil {
+				t.Fatal("expected error, got nil")
+			}
+		})
+	}
+}
+
+func refNames(in []providers.SecretMetadata) []string {
+	out := make([]string, len(in))
+	for i, m := range in {
+		out[i] = m.Ref.Name
+	}
+	return out
+}
+
+func mapsEqual(a, b map[string]string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for k, v := range a {
+		if b[k] != v {
+			return false
+		}
+	}
+	return true
+}
