@@ -47,6 +47,12 @@ const (
 	ConfigRegion   = "region"
 	ConfigRoleArn  = "roleArn"
 	ConfigEndpoint = "endpoint"
+	// ConfigTagFilter is an optional map[string]string of AWS tags every
+	// listed secret MUST carry to be returned from ListMetadata. Applied
+	// in addition to ProviderScope.LabelSelector (AND semantics). Provider
+	// instances pinned to a tenant/environment use this so a misconfigured
+	// caller can't enumerate beyond the IAM tag boundary.
+	ConfigTagFilter = "tagFilter"
 )
 
 // Register wires the AWS Secrets Manager factory into r under Kind.
@@ -95,13 +101,58 @@ func New(ctx context.Context, cfg providers.Config) (providers.Provider, error) 
 		})
 	}
 
-	return &Provider{client: secretsmanager.NewFromConfig(awsCfg, smOpts...)}, nil
+	tagFilter, err := readTagFilter(cfg[ConfigTagFilter])
+	if err != nil {
+		return nil, fmt.Errorf("awssecretsmanager: %w", err)
+	}
+
+	return &Provider{
+		client:    secretsmanager.NewFromConfig(awsCfg, smOpts...),
+		tagFilter: tagFilter,
+	}, nil
+}
+
+// readTagFilter accepts either map[string]string or map[string]any (the
+// latter is what comes out of a JSON unmarshal). Empty / nil / absent
+// means "no filter". Non-string values fail loudly so a typo in chart
+// values doesn't silently disable the safety net.
+func readTagFilter(raw any) (map[string]string, error) {
+	if raw == nil {
+		return nil, nil
+	}
+	switch m := raw.(type) {
+	case map[string]string:
+		if len(m) == 0 {
+			return nil, nil
+		}
+		out := make(map[string]string, len(m))
+		for k, v := range m {
+			out[k] = v
+		}
+		return out, nil
+	case map[string]any:
+		if len(m) == 0 {
+			return nil, nil
+		}
+		out := make(map[string]string, len(m))
+		for k, v := range m {
+			s, ok := v.(string)
+			if !ok {
+				return nil, fmt.Errorf("config.tagFilter[%q] must be a string, got %T", k, v)
+			}
+			out[k] = s
+		}
+		return out, nil
+	default:
+		return nil, fmt.Errorf("config.tagFilter must be map[string]string, got %T", raw)
+	}
 }
 
 // Provider is an AWS Secrets Manager backend speaking the
 // metadata/value-split providers.Provider interface.
 type Provider struct {
-	client awsSMClient
+	client    awsSMClient
+	tagFilter map[string]string
 }
 
 // GetMetadata returns descriptive metadata without reading the value.
@@ -132,8 +183,16 @@ func (p *Provider) GetMetadata(ctx context.Context, ref providers.SecretRef) (pr
 // one SecretMetadata per entry. Pagination is handled internally — the
 // returned slice is fully materialized.
 //
-// LabelSelector matching is not yet implemented; every secret in scope
-// is returned regardless of scope.LabelSelector.
+// Results are filtered post-list by:
+//   - the Provider's instance-level tagFilter (Config["tagFilter"]),
+//     intended for "this agent only sees secrets tagged for this env";
+//   - the per-call scope.LabelSelector, intended for "this discover job
+//     only wants secrets matching X".
+//
+// AWS's ListSecrets API does NOT honour tag-based IAM resource
+// conditions (only Describe/Get do), so without this filter every
+// secret in the account leaks into the catalog. AND semantics: a row
+// must match BOTH filters to be returned.
 func (p *Provider) ListMetadata(ctx context.Context, scope providers.ProviderScope) ([]providers.SecretMetadata, error) {
 	var out []providers.SecretMetadata
 	var token *string
@@ -149,13 +208,20 @@ func (p *Provider) ListMetadata(ctx context.Context, scope providers.ProviderSco
 			if s.Name == nil {
 				continue
 			}
+			labels := tagsToLabels(s.Tags)
+			if !matchesAll(labels, p.tagFilter) {
+				continue
+			}
+			if !matchesAll(labels, scope.LabelSelector) {
+				continue
+			}
 			out = append(out, providers.SecretMetadata{
 				Ref: providers.SecretRef{
 					Provider: Kind,
 					Scope:    scope.Scope,
 					Name:     *s.Name,
 				},
-				Labels:    tagsToLabels(s.Tags),
+				Labels:    labels,
 				CreatedAt: derefTime(s.CreatedDate),
 				UpdatedAt: derefTime(s.LastChangedDate),
 			})
@@ -166,6 +232,20 @@ func (p *Provider) ListMetadata(ctx context.Context, scope providers.ProviderSco
 		token = page.NextToken
 	}
 	return out, nil
+}
+
+// matchesAll returns true when every key/value in want is present in
+// got with the same value. A nil/empty want matches anything.
+func matchesAll(got, want map[string]string) bool {
+	if len(want) == 0 {
+		return true
+	}
+	for k, v := range want {
+		if got[k] != v {
+			return false
+		}
+	}
+	return true
 }
 
 // GetValue reads the secret payload. This is the only method on the
