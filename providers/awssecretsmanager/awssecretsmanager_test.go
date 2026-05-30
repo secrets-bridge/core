@@ -292,24 +292,24 @@ func listFixture() []*secretsmanager.ListSecretsOutput {
 		{
 			SecretList: []smtypes.SecretListEntry{
 				{
-					Name: awsv2.String("/eks/uat/archive/env"),
+					Name: awsv2.String("team-alpha/uat/db"),
 					Tags: []smtypes.Tag{
-						{Key: awsv2.String("EnvironmentName"), Value: awsv2.String("E-Government-Uat")},
-						{Key: awsv2.String("Project"), Value: awsv2.String("Electronic Government")},
+						{Key: awsv2.String("EnvironmentName"), Value: awsv2.String("tenant-a-uat")},
+						{Key: awsv2.String("Project"), Value: awsv2.String("alpha")},
 					},
 				},
 				{
-					Name: awsv2.String("/eks/prod/archive/env"),
+					Name: awsv2.String("team-alpha/prod/db"),
 					Tags: []smtypes.Tag{
-						{Key: awsv2.String("EnvironmentName"), Value: awsv2.String("E-Government-Prod")},
-						{Key: awsv2.String("Project"), Value: awsv2.String("Electronic Government")},
+						{Key: awsv2.String("EnvironmentName"), Value: awsv2.String("tenant-a-prod")},
+						{Key: awsv2.String("Project"), Value: awsv2.String("alpha")},
 					},
 				},
 				{
-					Name: awsv2.String("/eks/uat/pension/env"),
+					Name: awsv2.String("team-beta/uat/db"),
 					Tags: []smtypes.Tag{
-						{Key: awsv2.String("EnvironmentName"), Value: awsv2.String("E-Government-Uat")},
-						{Key: awsv2.String("Project"), Value: awsv2.String("Pension")},
+						{Key: awsv2.String("EnvironmentName"), Value: awsv2.String("tenant-a-uat")},
+						{Key: awsv2.String("Project"), Value: awsv2.String("beta")},
 					},
 				},
 			},
@@ -321,7 +321,7 @@ func TestListMetadata_TagFilterDropsNonMatchingRows(t *testing.T) {
 	fc := &fakeClient{listPages: listFixture()}
 	p := &Provider{
 		client:    fc,
-		tagFilter: map[string]string{"EnvironmentName": "E-Government-Uat"},
+		tagFilter: map[string]string{"EnvironmentName": "tenant-a-uat"},
 	}
 
 	got, err := p.ListMetadata(t.Context(), providers.ProviderScope{Scope: "default"})
@@ -332,7 +332,7 @@ func TestListMetadata_TagFilterDropsNonMatchingRows(t *testing.T) {
 		t.Fatalf("expected 2 UAT rows, got %d: %+v", len(got), refNames(got))
 	}
 	for _, m := range got {
-		if m.Labels["EnvironmentName"] != "E-Government-Uat" {
+		if m.Labels["EnvironmentName"] != "tenant-a-uat" {
 			t.Errorf("leaked non-UAT row %q with EnvironmentName=%q", m.Ref.Name, m.Labels["EnvironmentName"])
 		}
 	}
@@ -342,18 +342,18 @@ func TestListMetadata_ScopeLabelSelectorANDsWithTagFilter(t *testing.T) {
 	fc := &fakeClient{listPages: listFixture()}
 	p := &Provider{
 		client:    fc,
-		tagFilter: map[string]string{"EnvironmentName": "E-Government-Uat"},
+		tagFilter: map[string]string{"EnvironmentName": "tenant-a-uat"},
 	}
 
 	got, err := p.ListMetadata(t.Context(), providers.ProviderScope{
 		Scope:         "default",
-		LabelSelector: map[string]string{"Project": "Pension"},
+		LabelSelector: map[string]string{"Project": "beta"},
 	})
 	if err != nil {
 		t.Fatalf("ListMetadata: %v", err)
 	}
-	if len(got) != 1 || got[0].Ref.Name != "/eks/uat/pension/env" {
-		t.Fatalf("AND of tagFilter+LabelSelector should leave only pension/env, got %v", refNames(got))
+	if len(got) != 1 || got[0].Ref.Name != "team-beta/uat/db" {
+		t.Fatalf("AND of tagFilter+LabelSelector should leave only team-beta/uat/db, got %v", refNames(got))
 	}
 }
 
