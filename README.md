@@ -34,3 +34,12 @@ error messages, serialized to telemetry, or exposed outside an explicit
 `GetValue` / `PutValue` call. `providers.SecretValue` redacts itself under
 `%v` and `%#v` to make accidental disclosure harder, but callers are still
 responsible for treating the underlying bytes with care.
+
+## Status
+
+`core` reached its target shape early in the polyrepo refactor and has
+remained stable. The provider interface + registry + AWS Secrets Manager
++ Vault connectors are the load-bearing surface every other repo
+imports. See [`skills/PROGRESS.md`](https://github.com/secrets-bridge/skills/blob/main/PROGRESS.md)
+for the slice-by-slice history of how this module is consumed across the
+api, agent, controller, and worker.
