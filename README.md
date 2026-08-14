@@ -19,12 +19,12 @@ the shared types used by the API, worker, agent, and controller services.
 
 ## Packages
 
-- `providers` — the `Provider` interface and registry. Providers expose a
+- `providers`: the `Provider` interface and registry. Providers expose a
   metadata plane (safe to log and cache) and a value plane (sensitive,
   never logged).
-- `sync` — placeholder for the reconciliation engine that copies secrets
+- `sync`: placeholder for the reconciliation engine that copies secrets
   between providers.
-- `types` — placeholder for cross-cutting value types shared across the
+- `types`: placeholder for cross-cutting value types shared across the
   module.
 
 ## Secret handling
