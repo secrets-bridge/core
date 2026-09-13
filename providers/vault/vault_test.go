@@ -125,6 +125,191 @@ func TestGetMetadata_Found(t *testing.T) {
 	}
 }
 
+// TestGetMetadata_LabelAllowlist_DropsDisallowedKeys is the regression
+// test for CORE-01: a Vault operator's custom_metadata can carry keys
+// that must never cross into the Secrets Bridge catalog. When
+// labelAllowlist is set, any custom_metadata key not on the list must be
+// dropped entirely — not just have its value blanked — so it never
+// reaches SecretMetadata.Labels (which the control plane persists and
+// serves back via GET /secrets).
+func TestGetMetadata_LabelAllowlist_DropsDisallowedKeys(t *testing.T) {
+	fl := &fakeLogical{
+		readResp: map[string]*vaultapi.Secret{
+			"kv/metadata/apps/db": {
+				Data: map[string]any{
+					"current_version": 1,
+					"custom_metadata": map[string]any{
+						"env":                "prod",
+						"team":               "billing",
+						"internal-ticket-id": "SECRET-JIRA-1234",
+					},
+				},
+			},
+		},
+	}
+	p := newTestProvider(fl, "")
+	p.labelAllowlist = map[string]struct{}{"env": {}, "team": {}}
+	ref := providers.SecretRef{Provider: Kind, Name: "apps/db"}
+
+	md, err := p.GetMetadata(t.Context(), ref)
+	if err != nil {
+		t.Fatalf("GetMetadata: %v", err)
+	}
+	if md.Labels["env"] != "prod" || md.Labels["team"] != "billing" {
+		t.Fatalf("allowlisted keys missing: %v", md.Labels)
+	}
+	if _, leaked := md.Labels["internal-ticket-id"]; leaked {
+		t.Fatalf("non-allowlisted key leaked into Labels: %v", md.Labels)
+	}
+	if len(md.Labels) != 2 {
+		t.Fatalf("expected exactly 2 labels, got %v", md.Labels)
+	}
+}
+
+// TestGetMetadata_LabelAllowlist_AllDropped confirms that when every
+// custom_metadata key is filtered out, Labels stays nil rather than an
+// empty-but-non-nil map (matches the "no custom_metadata" shape).
+func TestGetMetadata_LabelAllowlist_AllDropped(t *testing.T) {
+	fl := &fakeLogical{
+		readResp: map[string]*vaultapi.Secret{
+			"kv/metadata/apps/db": {
+				Data: map[string]any{
+					"current_version": 1,
+					"custom_metadata": map[string]any{"secret-note": "do-not-leak"},
+				},
+			},
+		},
+	}
+	p := newTestProvider(fl, "")
+	p.labelAllowlist = map[string]struct{}{"env": {}}
+	ref := providers.SecretRef{Provider: Kind, Name: "apps/db"}
+
+	md, err := p.GetMetadata(t.Context(), ref)
+	if err != nil {
+		t.Fatalf("GetMetadata: %v", err)
+	}
+	if md.Labels != nil {
+		t.Fatalf("expected nil Labels when every key is filtered, got %v", md.Labels)
+	}
+}
+
+// TestGetMetadata_NilAllowlist_PreservesPriorBehavior confirms the
+// default (no ConfigLabelAllowlist set) is unchanged: every
+// custom_metadata key is still copied verbatim.
+func TestGetMetadata_NilAllowlist_PreservesPriorBehavior(t *testing.T) {
+	fl := &fakeLogical{
+		readResp: map[string]*vaultapi.Secret{
+			"kv/metadata/apps/db": {
+				Data: map[string]any{
+					"current_version": 1,
+					"custom_metadata": map[string]any{"env": "prod", "team": "billing"},
+				},
+			},
+		},
+	}
+	p := newTestProvider(fl, "") // labelAllowlist left nil
+	ref := providers.SecretRef{Provider: Kind, Name: "apps/db"}
+
+	md, err := p.GetMetadata(t.Context(), ref)
+	if err != nil {
+		t.Fatalf("GetMetadata: %v", err)
+	}
+	if md.Labels["env"] != "prod" || md.Labels["team"] != "billing" {
+		t.Fatalf("nil allowlist must copy every custom_metadata key, got %v", md.Labels)
+	}
+}
+
+func TestReadLabelAllowlist(t *testing.T) {
+	cases := []struct {
+		name    string
+		raw     any
+		want    []string // keys expected present in the returned set; nil want means result must be nil
+		wantErr bool
+	}{
+		{"nil", nil, nil, false},
+		{"empty []string", []string{}, nil, false},
+		{"empty []any", []any{}, nil, false},
+		{"[]string", []string{"env", "team"}, []string{"env", "team"}, false},
+		{"[]any of strings", []any{"env", "team"}, []string{"env", "team"}, false},
+		{"[]any with non-string element", []any{"env", 7}, nil, true},
+		{"wrong type", "env,team", nil, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := readLabelAllowlist(tc.raw)
+			if tc.wantErr {
+				if err == nil {
+					t.Fatal("expected error, got nil")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if tc.want == nil {
+				if got != nil {
+					t.Fatalf("expected nil set, got %v", got)
+				}
+				return
+			}
+			if len(got) != len(tc.want) {
+				t.Fatalf("expected %v, got %v", tc.want, got)
+			}
+			for _, k := range tc.want {
+				if _, ok := got[k]; !ok {
+					t.Fatalf("expected key %q in set, got %v", k, got)
+				}
+			}
+		})
+	}
+}
+
+// TestNew_ParsesLabelAllowlistFromConfig confirms the config key is
+// wired end-to-end through New(), including the []any shape a JSON/YAML
+// unmarshal produces.
+func TestNew_ParsesLabelAllowlistFromConfig(t *testing.T) {
+	cfg := providers.Config{
+		ConfigAddress:        "https://vault.example.com",
+		ConfigAuthMethod:     authMethodToken,
+		ConfigToken:          "root",
+		ConfigLabelAllowlist: []any{"env", "team"},
+	}
+	prov, err := New(t.Context(), cfg)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	p, ok := prov.(*Provider)
+	if !ok {
+		t.Fatalf("New returned %T, want *Provider", prov)
+	}
+	if _, ok := p.labelAllowlist["env"]; !ok {
+		t.Fatalf("labelAllowlist missing %q: %v", "env", p.labelAllowlist)
+	}
+	if _, ok := p.labelAllowlist["team"]; !ok {
+		t.Fatalf("labelAllowlist missing %q: %v", "team", p.labelAllowlist)
+	}
+}
+
+// TestNew_RejectsInvalidLabelAllowlist confirms a malformed
+// ConfigLabelAllowlist fails New() loudly rather than being silently
+// ignored (which would look like "allowlist active" while actually
+// copying everything).
+func TestNew_RejectsInvalidLabelAllowlist(t *testing.T) {
+	cfg := providers.Config{
+		ConfigAddress:        "https://vault.example.com",
+		ConfigAuthMethod:     authMethodToken,
+		ConfigToken:          "root",
+		ConfigLabelAllowlist: "env,team", // wrong type: must be a list
+	}
+	_, err := New(t.Context(), cfg)
+	if err == nil {
+		t.Fatal("expected error for malformed labelAllowlist config")
+	}
+	if !contains(err.Error(), "labelAllowlist") {
+		t.Fatalf("error %q does not mention labelAllowlist", err.Error())
+	}
+}
+
 func TestGetMetadata_NotFound(t *testing.T) {
 	// Vault returns nil Secret on missing path; the provider must map
 	// that to ErrNotFound so callers can branch on errors.Is.

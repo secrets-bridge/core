@@ -21,6 +21,23 @@
 //     computes it after GetValue.
 //   - LabelSelector matching against custom_metadata is not yet
 //     implemented; ListMetadata returns every leaf in scope.
+//
+// custom_metadata trust boundary:
+//   - GetMetadata and ListMetadata copy a KV v2 path's custom_metadata
+//     into SecretMetadata.Labels (see that field's doc comment in
+//     providers.SecretMetadata for the general contract). custom_metadata
+//     is operator-supplied and lives in Vault's metadata plane, which is
+//     usually writable by a broader set of principals than the data
+//     plane; whatever is present there is copied verbatim and the
+//     control plane persists + returns it via GET /secrets.
+//   - By default every custom_metadata key is copied, preserving prior
+//     behavior. Deployments that cannot guarantee operators keep
+//     sensitive material out of custom_metadata should set
+//     ConfigLabelAllowlist to the specific keys that are safe to expose
+//     in the catalog; every other key is dropped entirely (not just its
+//     value).
+//   - This connector never reads or copies KV v2 secret DATA into
+//     Labels — only the metadata endpoint's custom_metadata block.
 package vault
 
 import (
@@ -53,6 +70,14 @@ const (
 	ConfigToken               = "token"
 	ConfigKVMount             = "kvMount"
 	ConfigKVPrefix            = "kvPrefix"
+	// ConfigLabelAllowlist is an optional list of custom_metadata keys
+	// permitted to propagate into SecretMetadata.Labels. Accepts
+	// []string or []any of strings (the latter is what comes out of a
+	// JSON/YAML unmarshal). Empty / nil / absent means "no allowlist" —
+	// every custom_metadata key is copied, matching the pre-existing
+	// default. See the package doc's "custom_metadata trust boundary"
+	// note for why a deployment might want to set this.
+	ConfigLabelAllowlist = "labelAllowlist"
 )
 
 const (
@@ -85,6 +110,12 @@ type Provider struct {
 	kvMount  string
 	kvPrefix string
 
+	// labelAllowlist restricts which custom_metadata keys are copied
+	// into SecretMetadata.Labels. nil means "no allowlist" — every key
+	// is copied (see ConfigLabelAllowlist and the package doc's
+	// "custom_metadata trust boundary" note).
+	labelAllowlist map[string]struct{}
+
 	authFn      func(ctx context.Context) error
 	tokenMu     sync.Mutex
 	tokenExpiry time.Time
@@ -111,10 +142,16 @@ func New(ctx context.Context, cfg providers.Config) (providers.Provider, error) 
 	}
 	kvPrefix := strings.Trim(stringFromCfg(cfg, ConfigKVPrefix), "/")
 
+	labelAllowlist, err := readLabelAllowlist(cfg[ConfigLabelAllowlist])
+	if err != nil {
+		return nil, fmt.Errorf("vault: %w", err)
+	}
+
 	p := &Provider{
-		logical:  vc.Logical(),
-		kvMount:  kvMount,
-		kvPrefix: kvPrefix,
+		logical:        vc.Logical(),
+		kvMount:        kvMount,
+		kvPrefix:       kvPrefix,
+		labelAllowlist: labelAllowlist,
 	}
 
 	method := stringFromCfg(cfg, ConfigAuthMethod)
@@ -169,7 +206,10 @@ func New(ctx context.Context, cfg providers.Config) (providers.Provider, error) 
 }
 
 // GetMetadata reads KV v2 metadata for ref.Name without ever touching
-// the value subtree.
+// the value subtree. The returned SecretMetadata.Labels is populated
+// from Vault's custom_metadata — see the package doc's "custom_metadata
+// trust boundary" note before relying on Labels for anything beyond
+// display/filtering.
 func (p *Provider) GetMetadata(ctx context.Context, ref providers.SecretRef) (providers.SecretMetadata, error) {
 	if err := p.renew(ctx); err != nil {
 		return providers.SecretMetadata{}, err
@@ -182,7 +222,7 @@ func (p *Provider) GetMetadata(ctx context.Context, ref providers.SecretRef) (pr
 	if resp == nil || resp.Data == nil {
 		return providers.SecretMetadata{}, fmt.Errorf("%w: %s", providers.ErrNotFound, ref)
 	}
-	return metadataFromKVv2(ref, resp.Data), nil
+	return p.metadataFromKVv2(ref, resp.Data), nil
 }
 
 // ListMetadata walks the KV v2 metadata subtree under scope and
@@ -359,7 +399,13 @@ func (p *Provider) walk(ctx context.Context, prefix, suffix string, out *[]strin
 	return nil
 }
 
-func metadataFromKVv2(ref providers.SecretRef, data map[string]any) providers.SecretMetadata {
+// metadataFromKVv2 maps a Vault KV v2 metadata response onto
+// SecretMetadata. custom_metadata is copied into Labels subject to
+// p.labelAllowlist — see the package doc's "custom_metadata trust
+// boundary" note and the ConfigLabelAllowlist doc comment. A nil
+// labelAllowlist copies every key (the pre-existing default behavior);
+// a non-nil one drops any key not explicitly listed, not just its value.
+func (p *Provider) metadataFromKVv2(ref providers.SecretRef, data map[string]any) providers.SecretMetadata {
 	md := providers.SecretMetadata{Ref: ref}
 	if v, ok := data["created_time"].(string); ok && v != "" {
 		if t, err := time.Parse(time.RFC3339Nano, v); err == nil {
@@ -380,11 +426,57 @@ func metadataFromKVv2(ref providers.SecretRef, data map[string]any) providers.Se
 	if cm, ok := data["custom_metadata"].(map[string]any); ok && len(cm) > 0 {
 		labels := make(map[string]string, len(cm))
 		for k, v := range cm {
+			if p.labelAllowlist != nil {
+				if _, allowed := p.labelAllowlist[k]; !allowed {
+					continue
+				}
+			}
 			labels[k] = fmt.Sprintf("%v", v)
 		}
-		md.Labels = labels
+		if len(labels) > 0 {
+			md.Labels = labels
+		}
 	}
 	return md
+}
+
+// readLabelAllowlist accepts []string or []any (the latter is what
+// comes out of a JSON/YAML unmarshal) and returns the set of
+// custom_metadata keys allowed to propagate into SecretMetadata.Labels.
+// Empty / nil / absent means "no allowlist" — every custom_metadata key
+// is copied, preserving the pre-existing default behavior. Non-string
+// elements fail loudly so a typo in chart values doesn't silently widen
+// the allowlist into a no-op.
+func readLabelAllowlist(raw any) (map[string]struct{}, error) {
+	if raw == nil {
+		return nil, nil
+	}
+	switch v := raw.(type) {
+	case []string:
+		if len(v) == 0 {
+			return nil, nil
+		}
+		out := make(map[string]struct{}, len(v))
+		for _, k := range v {
+			out[k] = struct{}{}
+		}
+		return out, nil
+	case []any:
+		if len(v) == 0 {
+			return nil, nil
+		}
+		out := make(map[string]struct{}, len(v))
+		for _, e := range v {
+			s, ok := e.(string)
+			if !ok {
+				return nil, fmt.Errorf("config.labelAllowlist must be a list of strings, got element of type %T", e)
+			}
+			out[s] = struct{}{}
+		}
+		return out, nil
+	default:
+		return nil, fmt.Errorf("config.labelAllowlist must be []string, got %T", raw)
+	}
 }
 
 func versionFromWrite(s *vaultapi.Secret) providers.SecretVersion {
