@@ -47,11 +47,29 @@ func (r SecretRef) String() string {
 	return fmt.Sprintf("%s://%s/%s@%s", r.Provider, r.Scope, r.Name, r.Version)
 }
 
-// SecretMetadata describes a secret without exposing its value. Anything in
-// this struct is considered non-sensitive and is safe to log and cache.
+// SecretMetadata describes a secret without exposing its value. Everything
+// in this struct is non-sensitive with respect to the secret's VALUE and is
+// safe to log and cache — but see the Labels field doc below for a
+// narrower trust-boundary caveat that applies specifically to it.
 type SecretMetadata struct {
-	Ref         SecretRef
-	Version     SecretVersion
+	Ref     SecretRef
+	Version SecretVersion
+	// Labels carries operator-supplied, provider-native metadata (for
+	// example Vault KV v2 custom_metadata, or AWS Secrets Manager tags).
+	// It is safe with respect to the secret's VALUE, but it is NOT
+	// sanitized or validated: the control plane persists it verbatim in
+	// secrets.labels and returns it via GET /secrets, so anything an
+	// operator has put into a provider's native metadata/tag fields
+	// becomes catalog-visible to anyone who can read that endpoint.
+	//
+	// This is a trust-boundary crossing, not a bug: the provider's
+	// metadata store and the Secrets Bridge catalog have different
+	// audiences. Provider connectors MUST document this boundary at the
+	// point they populate Labels, and MAY offer a per-connection
+	// label-key allowlist so a deployment can restrict which keys are
+	// permitted to cross into the catalog (see e.g. providers/vault's
+	// ConfigLabelAllowlist). Connectors and callers must never promote
+	// SecretValue content into Labels.
 	Labels      map[string]string
 	ContentType string
 	CreatedAt   time.Time
