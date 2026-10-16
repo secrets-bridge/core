@@ -40,7 +40,8 @@ go mod tidy   # CI fails if this produces a diff
 ## Rules for this repo
 
 - **Infra-free.** No database driver, no Redis client, no HTTP framework. Anything that needs Postgres or Redis belongs in `api`.
-- **Never log or return a secret value.** `SecretValue.String()` and `GoString()` return `<redacted>`; keep it that way and never put `SecretValue` bytes in an error message.
+- **Never log or return a secret value.** `SecretValue` prints and marshals as `<redacted>` (every fmt verb via `Format`, `MarshalJSON`, `MarshalText`, `MarshalBinary`, slog `LogValue`); keep it that way and never put `SecretValue` bytes in an error message. Reflection still prints raw bytes for `%p`, a misused `%w`, or a `SecretValue` in an unexported struct field, so don't do those.
+- **Vault paths are validated, never cleaned.** Names, scopes, `kvMount` and `kvPrefix` go through the checks in `providers/vault` and are joined verbatim. Don't reintroduce `path.Join` there; it resolves `..`.
 - Provider-specific auth stays inside its own package.
 - New connectors follow the existing shape: `providers/<kind>/<kind>.go` with tests, a small interface over the SDK client so tests can inject a fake, an exported `Kind` and `Register(*providers.Registry)` (no `init()`), and not-found errors mapped to `providers.ErrNotFound`.
 - Interface changes affect every Go repo. Open an issue first and coordinate the follow-up PRs.

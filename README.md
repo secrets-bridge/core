@@ -31,9 +31,10 @@ the shared types used by the API, worker, agent, and controller services.
 
 Secret *values* are confidential. They must never be logged, embedded in
 error messages, serialized to telemetry, or exposed outside an explicit
-`GetValue` / `PutValue` call. `providers.SecretValue` redacts itself under
-`%v` and `%#v` to make accidental disclosure harder, but callers are still
-responsible for treating the underlying bytes with care.
+`GetValue` / `PutValue` call. `providers.SecretValue` prints as
+`<redacted>` under every fmt verb, `encoding/json`, text and binary
+marshalers and `log/slog` to make accidental disclosure harder, but callers
+are still responsible for treating the underlying bytes with care.
 
 ## Status
 
