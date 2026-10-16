@@ -65,11 +65,11 @@ func TestRegister(t *testing.T) {
 
 func TestPathBuilding(t *testing.T) {
 	cases := []struct {
-		name      string
-		prefix    string
-		secret    string
-		wantData  string
-		wantMeta  string
+		name     string
+		prefix   string
+		secret   string
+		wantData string
+		wantMeta string
 	}{
 		{"no prefix", "", "apps/db", "kv/data/apps/db", "kv/metadata/apps/db"},
 		{"with prefix", "prod-eu", "apps/db", "kv/data/prod-eu/apps/db", "kv/metadata/prod-eu/apps/db"},
@@ -78,13 +78,47 @@ func TestPathBuilding(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			p := newTestProvider(&fakeLogical{}, tc.prefix)
-			if got := p.dataPath(tc.secret); got != tc.wantData {
-				t.Errorf("dataPath: got %q want %q", got, tc.wantData)
+			if got, err := p.dataPath(tc.secret); err != nil || got != tc.wantData {
+				t.Errorf("dataPath: got %q, %v want %q", got, err, tc.wantData)
 			}
-			if got := p.metadataPath(tc.secret); got != tc.wantMeta {
-				t.Errorf("metadataPath: got %q want %q", got, tc.wantMeta)
+			if got, err := p.metadataPath(tc.secret); err != nil || got != tc.wantMeta {
+				t.Errorf("metadataPath: got %q, %v want %q", got, err, tc.wantMeta)
 			}
 		})
+	}
+}
+
+// Path validation failures must be matchable with errors.Is so callers
+// can tell "refused" apart from "not found" (CORE-N-01).
+func TestPathErrorsWrapErrInvalidPath(t *testing.T) {
+	fl := &fakeLogical{}
+	p := newTestProvider(fl, "team-a")
+	ref := providers.SecretRef{Provider: Kind, Name: "x/../../../other-kv/data/team-b/app/db"}
+
+	_, err := p.GetValue(t.Context(), ref)
+	if !errors.Is(err, ErrInvalidPath) {
+		t.Fatalf("GetValue: want ErrInvalidPath, got %v", err)
+	}
+	if errors.Is(err, providers.ErrNotFound) {
+		t.Fatalf("GetValue: validation error must not match ErrNotFound: %v", err)
+	}
+	if contains(err.Error(), "other-kv") {
+		t.Fatalf("error echoes the rejected input: %v", err)
+	}
+
+	_, err = p.ListMetadata(t.Context(), providers.ProviderScope{Provider: Kind, Scope: "../team-b"})
+	if !errors.Is(err, ErrInvalidPath) {
+		t.Fatalf("ListMetadata: want ErrInvalidPath, got %v", err)
+	}
+
+	_, err = New(t.Context(), providers.Config{
+		ConfigAddress:    "https://vault.example.com",
+		ConfigAuthMethod: authMethodToken,
+		ConfigToken:      "root",
+		ConfigKVPrefix:   "team-a/../team-b",
+	})
+	if !errors.Is(err, ErrInvalidPath) {
+		t.Fatalf("New: want ErrInvalidPath, got %v", err)
 	}
 }
 

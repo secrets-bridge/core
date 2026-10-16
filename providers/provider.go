@@ -12,6 +12,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
+	"log/slog"
 	"sync"
 	"time"
 )
@@ -88,6 +90,21 @@ type SecretVersion struct {
 // SecretValue carries the sensitive payload of a secret. Implementations
 // and callers must treat instances of this type as confidential: do not log,
 // stringify, marshal to telemetry, or include in error messages.
+//
+// Every generic way of turning a SecretValue into text or bytes yields
+// "<redacted>": fmt (all verbs, through Format), encoding/json, anything
+// that uses encoding.TextMarshaler or encoding.BinaryMarshaler (xml,
+// gob, many YAML and cache clients) and log/slog (LogValue). The same
+// holds when the value is a field, pointer field, slice or map element
+// of something else being printed or marshalled. Callers that need the
+// payload must read SecretValue.Bytes explicitly.
+//
+// Known gaps, which only a change to the exported shape could close:
+//   - fmt's bad-verb path (%p on a SecretValue, %w outside Errorf or on
+//     a non-error; go vet flags both) and a SecretValue held in an
+//     UNEXPORTED struct field are printed by reflection, which skips
+//     every method above and shows Bytes as a list of numbers.
+//   - Printing or marshalling the Bytes field itself is not intercepted.
 type SecretValue struct {
 	// Bytes is the raw secret payload.
 	Bytes []byte
@@ -96,13 +113,36 @@ type SecretValue struct {
 	ContentType string
 }
 
+const redacted = "<redacted>"
+
 // String intentionally hides the value to avoid accidental disclosure via
 // fmt.Sprintf("%v", ...) or log statements. Callers that need the bytes
 // must read SecretValue.Bytes explicitly.
-func (SecretValue) String() string { return "<redacted>" }
+func (SecretValue) String() string { return redacted }
 
 // GoString prevents disclosure under the %#v verb.
-func (SecretValue) GoString() string { return "<redacted>" }
+func (SecretValue) GoString() string { return redacted }
+
+// Format implements fmt.Formatter so every verb, flag and width (%d,
+// %x, %08b, %U ...) prints "<redacted>". String and GoString alone only
+// cover the string verbs; the rest fell through to the raw bytes.
+func (SecretValue) Format(f fmt.State, _ rune) { _, _ = io.WriteString(f, redacted) }
+
+// MarshalJSON implements json.Marshaler. Without it encoding/json (and
+// slog's JSONHandler) emitted Bytes as base64.
+func (SecretValue) MarshalJSON() ([]byte, error) { return []byte(`"` + redacted + `"`), nil }
+
+// MarshalText implements encoding.TextMarshaler for encoders that prefer
+// it (encoding/xml, slog's TextHandler, most YAML libraries).
+func (SecretValue) MarshalText() ([]byte, error) { return []byte(redacted), nil }
+
+// MarshalBinary implements encoding.BinaryMarshaler, which encoding/gob
+// and many cache and queue clients use to serialize a value.
+func (SecretValue) MarshalBinary() ([]byte, error) { return []byte(redacted), nil }
+
+// LogValue implements slog.LogValuer so a SecretValue handed to any slog
+// handler resolves to "<redacted>" before the handler sees it.
+func (SecretValue) LogValue() slog.Value { return slog.StringValue(redacted) }
 
 // PutOptions controls how PutValue writes a new value.
 type PutOptions struct {

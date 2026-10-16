@@ -38,6 +38,21 @@
 //     value).
 //   - This connector never reads or copies KV v2 secret DATA into
 //     Labels — only the metadata endpoint's custom_metadata block.
+//
+// Path safety:
+//   - Every Vault path is assembled from kvMount, the KV v2 API segment,
+//     kvPrefix (or a list scope) and the secret name. Each part is
+//     validated and the parts are joined verbatim; nothing is cleaned or
+//     resolved, so a name can never climb out of the prefix or the mount.
+//   - A part is refused with ErrInvalidPath, before any request is made,
+//     if it has a "." or ".." segment, an empty segment, a backslash, a
+//     control character, invalid UTF-8, or a percent-encoded ".", "/" or
+//     "\" (checked again after each layer of percent-decoding).
+//   - kvMount, kvPrefix and list scopes may carry one leading and one
+//     trailing "/" ("secret/", "/prod/"); those are stripped. A secret
+//     name must already be canonical: no leading or trailing "/".
+//   - Keys returned by a LIST that fail the same rules are skipped, not
+//     followed.
 package vault
 
 import (
@@ -45,10 +60,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"path"
 	"strings"
 	"sync"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	vaultapi "github.com/hashicorp/vault/api"
 	authkubernetes "github.com/hashicorp/vault/api/auth/kubernetes"
@@ -86,6 +102,26 @@ const (
 	authMethodToken    = "token"
 	tokenRefreshMargin = 30 * time.Second
 )
+
+// ErrInvalidPath is returned when a secret name, list scope, kvMount or
+// kvPrefix is not a safe KV path (see "Path safety" in the package doc).
+// The error says which part failed and why, but never echoes the input
+// and never carries a secret value, so it is safe to log and to return
+// to the control plane. It is deliberately distinct from
+// providers.ErrNotFound: the request was refused, not looked up.
+var ErrInvalidPath = errors.New("vault: invalid path")
+
+// Names of the path parts, used in ErrInvalidPath messages.
+const (
+	partName  = "secret name"
+	partScope = "list scope"
+	partMount = ConfigKVMount
+	partPfx   = ConfigKVPrefix
+)
+
+// maxPercentDecodes bounds how many layers of percent-encoding a part
+// may carry before it is refused outright.
+const maxPercentDecodes = 3
 
 // Register wires the Vault factory into r under Kind. Call from main
 // during startup; the package does NOT register itself via init() to
@@ -128,6 +164,22 @@ func New(ctx context.Context, cfg providers.Config) (providers.Provider, error) 
 		return nil, fmt.Errorf("vault: %s is required", ConfigAddress)
 	}
 
+	kvMount := defaultKVMount
+	if m, _ := cfg[ConfigKVMount].(string); m != "" {
+		clean, err := cleanDir(partMount, m)
+		if err != nil {
+			return nil, err
+		}
+		if clean == "" {
+			return nil, invalidPath(partMount, "has no path segments")
+		}
+		kvMount = clean
+	}
+	kvPrefix, err := cleanDir(partPfx, stringFromCfg(cfg, ConfigKVPrefix))
+	if err != nil {
+		return nil, err
+	}
+
 	vc, err := vaultapi.NewClient(&vaultapi.Config{Address: addr})
 	if err != nil {
 		return nil, fmt.Errorf("vault: build client: %w", err)
@@ -135,12 +187,6 @@ func New(ctx context.Context, cfg providers.Config) (providers.Provider, error) 
 	if ns, _ := cfg[ConfigNamespace].(string); ns != "" {
 		vc.SetNamespace(ns)
 	}
-
-	kvMount := defaultKVMount
-	if m, _ := cfg[ConfigKVMount].(string); m != "" {
-		kvMount = strings.Trim(m, "/")
-	}
-	kvPrefix := strings.Trim(stringFromCfg(cfg, ConfigKVPrefix), "/")
 
 	labelAllowlist, err := readLabelAllowlist(cfg[ConfigLabelAllowlist])
 	if err != nil {
@@ -211,10 +257,13 @@ func New(ctx context.Context, cfg providers.Config) (providers.Provider, error) 
 // trust boundary" note before relying on Labels for anything beyond
 // display/filtering.
 func (p *Provider) GetMetadata(ctx context.Context, ref providers.SecretRef) (providers.SecretMetadata, error) {
+	metaPath, err := p.metadataPath(ref.Name)
+	if err != nil {
+		return providers.SecretMetadata{}, err
+	}
 	if err := p.renew(ctx); err != nil {
 		return providers.SecretMetadata{}, err
 	}
-	metaPath := p.metadataPath(ref.Name)
 	resp, err := p.logical.ReadWithContext(ctx, metaPath)
 	if err != nil {
 		return providers.SecretMetadata{}, fmt.Errorf("vault: read %s: %w", metaPath, err)
@@ -229,12 +278,25 @@ func (p *Provider) GetMetadata(ctx context.Context, ref providers.SecretRef) (pr
 // returns one SecretMetadata per leaf. Scope.Scope may override the
 // configured kvPrefix.
 func (p *Provider) ListMetadata(ctx context.Context, scope providers.ProviderScope) ([]providers.SecretMetadata, error) {
-	if err := p.renew(ctx); err != nil {
-		return nil, err
-	}
 	prefix := p.kvPrefix
 	if scope.Scope != "" {
-		prefix = strings.Trim(scope.Scope, "/")
+		clean, err := cleanDir(partScope, scope.Scope)
+		if err != nil {
+			return nil, err
+		}
+		if clean == "" {
+			// "/" would otherwise widen the listing to the whole mount.
+			return nil, invalidPath(partScope, "has no path segments")
+		}
+		prefix = clean
+	}
+	// Validate the root list path up front so a bad mount or prefix is
+	// refused before renew() can make a login request.
+	if _, err := p.listPath(prefix, ""); err != nil {
+		return nil, err
+	}
+	if err := p.renew(ctx); err != nil {
+		return nil, err
 	}
 
 	var leaves []string
@@ -271,10 +333,13 @@ func (p *Provider) ListMetadata(ctx context.Context, scope providers.ProviderSco
 // GetValue reads the KV v2 data subtree for ref.Name. Callers MUST NOT
 // log the returned SecretValue.Bytes.
 func (p *Provider) GetValue(ctx context.Context, ref providers.SecretRef) (providers.SecretValue, error) {
+	dataPath, err := p.dataPath(ref.Name)
+	if err != nil {
+		return providers.SecretValue{}, err
+	}
 	if err := p.renew(ctx); err != nil {
 		return providers.SecretValue{}, err
 	}
-	dataPath := p.dataPath(ref.Name)
 	resp, err := p.logical.ReadWithContext(ctx, dataPath)
 	if err != nil {
 		return providers.SecretValue{}, fmt.Errorf("vault: read %s: %w", dataPath, err)
@@ -301,6 +366,10 @@ func (p *Provider) GetValue(ctx context.Context, ref providers.SecretRef) (provi
 // as `{"value":"<raw>"}` so callers don't have to think about the KV
 // v2 envelope.
 func (p *Provider) PutValue(ctx context.Context, ref providers.SecretRef, value providers.SecretValue, opts providers.PutOptions) (providers.SecretVersion, error) {
+	dataPath, err := p.dataPath(ref.Name)
+	if err != nil {
+		return providers.SecretVersion{}, err
+	}
 	if err := p.renew(ctx); err != nil {
 		return providers.SecretVersion{}, err
 	}
@@ -310,7 +379,6 @@ func (p *Provider) PutValue(ctx context.Context, ref providers.SecretRef, value 
 		kv = map[string]any{"value": string(value.Bytes)}
 	}
 
-	dataPath := p.dataPath(ref.Name)
 	resp, err := p.logical.WriteWithContext(ctx, dataPath, map[string]any{"data": kv})
 	if err != nil {
 		return providers.SecretVersion{}, fmt.Errorf("vault: write %s: %w", dataPath, err)
@@ -340,35 +408,184 @@ func (p *Provider) setExpiry(t time.Time) {
 
 // dataPath joins the mount, "data", optional prefix, and the secret
 // name into a KV v2 read/write path.
-func (p *Provider) dataPath(name string) string {
-	return p.kvJoin("data", name)
+func (p *Provider) dataPath(name string) (string, error) {
+	return p.secretPath("data", name)
 }
 
 // metadataPath is the metadata-side companion to dataPath.
-func (p *Provider) metadataPath(name string) string {
-	return p.kvJoin("metadata", name)
+func (p *Provider) metadataPath(name string) (string, error) {
+	return p.secretPath("metadata", name)
 }
 
-func (p *Provider) kvJoin(api, suffix string) string {
-	parts := []string{p.kvMount, api}
-	if p.kvPrefix != "" {
-		parts = append(parts, p.kvPrefix)
+// secretPath builds {mount}/{api}/{prefix}/{name}. Every part is
+// validated and the parts are joined as-is: no path.Join, so ".." and
+// "//" are refused rather than resolved.
+func (p *Provider) secretPath(api, name string) (string, error) {
+	if name == "" {
+		return "", invalidPath(partName, "is empty")
+	}
+	if strings.HasPrefix(name, "/") || strings.HasSuffix(name, "/") {
+		return "", invalidPath(partName, `must not start or end with "/"`)
+	}
+	if problem := pathProblem(name); problem != "" {
+		return "", invalidPath(partName, problem)
+	}
+	parts, err := p.basePath(api, p.kvPrefix)
+	if err != nil {
+		return "", err
+	}
+	return strings.Join(append(parts, name), "/"), nil
+}
+
+// listPath builds {mount}/metadata/{prefix}/{suffix} for a KV v2 LIST.
+// prefix is the configured kvPrefix or a cleaned list scope; suffix is
+// the relative directory walk has reached.
+func (p *Provider) listPath(prefix, suffix string) (string, error) {
+	parts, err := p.basePath("metadata", prefix)
+	if err != nil {
+		return "", err
 	}
 	if suffix != "" {
+		if problem := pathProblem(suffix); problem != "" {
+			return "", invalidPath(partName, problem)
+		}
 		parts = append(parts, suffix)
 	}
-	return path.Join(parts...)
+	return strings.Join(parts, "/"), nil
+}
+
+// basePath re-checks the stored mount and prefix on every call, so a
+// Provider assembled without New cannot skip validation.
+func (p *Provider) basePath(api, prefix string) ([]string, error) {
+	if p.kvMount == "" {
+		return nil, invalidPath(partMount, "is empty")
+	}
+	if problem := pathProblem(p.kvMount); problem != "" {
+		return nil, invalidPath(partMount, problem)
+	}
+	parts := []string{p.kvMount, api}
+	if prefix != "" {
+		if problem := pathProblem(prefix); problem != "" {
+			return nil, invalidPath(partPfx, problem)
+		}
+		parts = append(parts, prefix)
+	}
+	return parts, nil
+}
+
+// cleanDir validates a mount, prefix or list scope. One leading and one
+// trailing "/" are accepted and stripped, since "secret/" and "/prod/"
+// are common ways to write them; the rest must pass pathProblem. An
+// input of "" or "/" returns "" and the caller decides what that means.
+func cleanDir(part, s string) (string, error) {
+	s = strings.TrimPrefix(s, "/")
+	s = strings.TrimSuffix(s, "/")
+	if s == "" {
+		return "", nil
+	}
+	if problem := pathProblem(s); problem != "" {
+		return "", invalidPath(part, problem)
+	}
+	return s, nil
+}
+
+// pathProblem reports why s is not a safe relative KV path, or "" when it
+// is. s is checked as given and again after each layer of
+// percent-decoding, so "%252e%252e" is caught as surely as "..", for the
+// benefit of any proxy or server that decodes more than once.
+func pathProblem(s string) string {
+	for decodes := 0; ; decodes++ {
+		if problem := layerProblem(s); problem != "" {
+			return problem
+		}
+		next := percentDecode(s)
+		if next == s {
+			return ""
+		}
+		if decodes == maxPercentDecodes {
+			return "is percent-encoded too many times"
+		}
+		s = next
+	}
+}
+
+// layerProblem checks one decoding layer of a path.
+func layerProblem(s string) string {
+	if !utf8.ValidString(s) {
+		return "is not valid UTF-8"
+	}
+	for _, r := range s {
+		if r == '\\' {
+			return "contains a backslash"
+		}
+		if unicode.IsControl(r) {
+			return "contains a control character"
+		}
+	}
+	lower := strings.ToLower(s)
+	for _, enc := range []string{"%2e", "%2f", "%5c"} {
+		if strings.Contains(lower, enc) {
+			return `contains a percent-encoded ".", "/" or "\"`
+		}
+	}
+	for _, seg := range strings.Split(s, "/") {
+		switch seg {
+		case "":
+			return "has an empty path segment"
+		case ".", "..":
+			return `has a "." or ".." path segment`
+		}
+	}
+	return ""
+}
+
+// percentDecode decodes every well-formed %XX escape in s and leaves
+// anything else (a bare "%", "%zz") as it is. Unlike url.PathUnescape it
+// never fails, so a stray "%" cannot hide an encoded "." elsewhere.
+func percentDecode(s string) string {
+	if !strings.Contains(s, "%") {
+		return s
+	}
+	var b strings.Builder
+	b.Grow(len(s))
+	for i := 0; i < len(s); i++ {
+		if s[i] == '%' && i+2 < len(s) && isHex(s[i+1]) && isHex(s[i+2]) {
+			b.WriteByte(unhex(s[i+1])<<4 | unhex(s[i+2]))
+			i += 2
+			continue
+		}
+		b.WriteByte(s[i])
+	}
+	return b.String()
+}
+
+func isHex(c byte) bool {
+	return ('0' <= c && c <= '9') || ('a' <= c && c <= 'f') || ('A' <= c && c <= 'F')
+}
+
+func unhex(c byte) byte {
+	switch {
+	case '0' <= c && c <= '9':
+		return c - '0'
+	case 'a' <= c && c <= 'f':
+		return c - 'a' + 10
+	default:
+		return c - 'A' + 10
+	}
+}
+
+// invalidPath wraps ErrInvalidPath with the part and the rule it broke.
+// It never includes the offending input.
+func invalidPath(part, problem string) error {
+	return fmt.Errorf("%w: %s %s", ErrInvalidPath, part, problem)
 }
 
 // walk recursively enumerates leaves under the configured prefix +
 // suffix. Suffix is the in-progress relative path during recursion.
 func (p *Provider) walk(ctx context.Context, prefix, suffix string, out *[]string) error {
-	listPath := path.Join(p.kvMount, "metadata")
-	if prefix != "" {
-		listPath = path.Join(listPath, prefix)
-	}
-	if suffix != "" {
-		listPath = path.Join(listPath, suffix)
+	listPath, err := p.listPath(prefix, suffix)
+	if err != nil {
+		return err
 	}
 
 	secret, err := p.logical.ListWithContext(ctx, listPath)
@@ -387,7 +604,18 @@ func (p *Provider) walk(ctx context.Context, prefix, suffix string, out *[]strin
 		if !ok {
 			continue
 		}
-		child := path.Join(suffix, strings.TrimSuffix(ks, "/"))
+		// KV v2 LIST returns one path segment per key, with a trailing
+		// "/" for a directory. Anything else ("..", "a/b", an encoded
+		// separator) is skipped rather than followed: following it is
+		// how a key could steer the walk outside the prefix.
+		seg := strings.TrimSuffix(ks, "/")
+		if strings.Contains(seg, "/") || pathProblem(seg) != "" {
+			continue
+		}
+		child := seg
+		if suffix != "" {
+			child = suffix + "/" + seg
+		}
 		if strings.HasSuffix(ks, "/") {
 			if err := p.walk(ctx, prefix, child, out); err != nil {
 				return err
