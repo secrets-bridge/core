@@ -1,0 +1,70 @@
+name: release
+
+# Releases the core module on a version tag. The tag must be strict
+# semver and point at a commit on main; the tagged commit is built and
+# tested again, then the job creates the GitHub Release and asks the Go
+# module proxy for the version so `go get github.com/secrets-bridge/core@vX.Y.Z`
+# resolves right away. All repos release under one shared version; see
+# RELEASING.md in secrets-bridge/.github.
+
+on:
+  push:
+    tags: ['v*.*.*']
+
+permissions:
+  contents: read
+
+env:
+  GO_VERSION: "1.27.x"
+
+jobs:
+  release:
+    name: GitHub release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          # main's history, to check the tag is on it.
+          fetch-depth: 0
+
+      - name: Check the version tag
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          if ! [[ "$TAG" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::$TAG is not a semver tag (vMAJOR.MINOR.PATCH or vMAJOR.MINOR.PATCH-pre)"
+            exit 1
+          fi
+          if ! git merge-base --is-ancestor HEAD origin/main; then
+            echo "::error::$TAG does not point at a commit on main"
+            exit 1
+          fi
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: false
+
+      - name: Build and test the tagged commit
+        run: |
+          go build ./...
+          go vet ./...
+          go test -race -count=1 ./...
+
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          args=(--title "$TAG" --verify-tag --generate-notes)
+          [[ "$TAG" == *-* ]] && args+=(--prerelease)
+          gh release create "$TAG" "${args[@]}"
+
+      - name: Publish the version to the Go module proxy
+        env:
+          TAG: ${{ github.ref_name }}
+          MODULE: github.com/${{ github.repository }}
+        run: GOPROXY=https://proxy.golang.org GOFLAGS=-mod=mod go list -m "${MODULE}@${TAG}"
