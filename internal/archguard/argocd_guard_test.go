@@ -27,8 +27,10 @@ func forbiddenImport(path string) bool {
 }
 
 // argoCDAPIPaths are Argo CD REST API paths. Our own routes never use
-// them.
-var argoCDAPIPaths = []string{"/api/v1/applications", "/api/v1/stream/applications"}
+// them. The session and account paths are there because a client that
+// only checked its token (session/userinfo) or its rights (account/can-i)
+// is still an Argo CD client.
+var argoCDAPIPaths = []string{"/api/v1/applications", "/api/v1/stream/applications", "/api/v1/session", "/api/v1/account"}
 
 // violations walks root and returns one line per non-test Go file that
 // imports an Argo CD client or contains an Argo CD API path.
@@ -117,13 +119,15 @@ func TestArgoCDGuardCatchesViolations(t *testing.T) {
 	write("client.go", "package x\n\nimport _ \"github.com/secrets-bridge/api/pkg/argocd\"\n")
 	write("upstream.go", "package x\n\nimport _ \"github.com/argoproj/argo-cd/v2/pkg/apiclient\"\n")
 	write("path.go", "package x\n\nconst p = \"/api/v1/applications/\" + \"x\"\n")
+	write("session.go", "package x\n\nconst p = \"/api/v1/session/userinfo\"\n")
+	write("account.go", "package x\n\nconst p = \"/api/v1/account/can-i/applications/sync/\" + \"x\"\n")
 	write("fine_test.go", "package x\n\nimport _ \"github.com/secrets-bridge/api/pkg/argocd\"\n\nconst p = \"/api/v1/applications\"\n")
 	write("clean.go", "package x\n\nconst q = \"/api/v1/gateways\"\n")
 	got := violations(t, root)
-	if len(got) != 3 {
-		t.Fatalf("violations = %q; want client.go, upstream.go and path.go only", got)
+	if len(got) != 5 {
+		t.Fatalf("violations = %q; want client.go, upstream.go, path.go, session.go and account.go only", got)
 	}
-	for _, want := range []string{"client.go", "upstream.go", "path.go"} {
+	for _, want := range []string{"client.go", "upstream.go", "path.go", "session.go", "account.go"} {
 		found := false
 		for _, v := range got {
 			found = found || strings.HasPrefix(v, want+":")
